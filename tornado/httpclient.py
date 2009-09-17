@@ -21,7 +21,6 @@ import collections
 import cStringIO
 import email.utils
 import errno
-import functools
 import httplib
 import ioloop
 import logging
@@ -334,9 +333,10 @@ def _curl_setup_request(curl, request, buffer, headers):
     curl.setopt(pycurl.URL, request.url)
     curl.setopt(pycurl.HTTPHEADER,
                 ["%s: %s" % i for i in request.headers.iteritems()])
+    def header_cb_wrapper(header_line):
+        _curl_header_callback(headers, header_line)
     try:
-        curl.setopt(pycurl.HEADERFUNCTION,
-                    functools.partial(_curl_header_callback, headers))
+        curl.setopt(pycurl.HEADERFUNCTION, header_cb_wrapper)
     except:
         # Old version of curl; response will not include headers
         pass
