@@ -47,10 +47,12 @@ import base64
 import binascii
 import calendar
 import Cookie
+import cStringIO
 import datetime
 import email.utils
 import escape
 import functools
+import gzip
 import hashlib
 import hmac
 import httplib
@@ -90,6 +92,10 @@ class RequestHandler(object):
         self.ui["modules"] = _O((n, self._ui_module(n, m)) for n, m in
                                 application.ui_modules.iteritems())
         self.clear()
+        # Check since connection is not available in WSGI
+        if hasattr(self.request, "connection"):
+            self.request.connection.stream.set_close_callback(
+                self.on_connection_close)
 
     @property
     def settings(self):
@@ -115,6 +121,20 @@ class RequestHandler(object):
 
         Useful to override in a handler if you want a common bottleneck for
         all of your requests.
+        """
+        pass
+
+    def on_connection_close(self):
+        """Called in async handlers if the client closed the connection.
+
+        You may override this to clean up resources associated with
+        long-lived connections.
+
+        Note that the select()-based implementation of IOLoop does not detect
+        closed connections and so this method will not be called until
+        you try (and fail) to produce some output.  The epoll- and kqueue-
+        based implementations should detect closed connections even while
+        the request is idle.
         """
         pass
 
@@ -252,7 +272,8 @@ class RequestHandler(object):
         if not value: return None
         parts = value.split("|")
         if len(parts) != 3: return None
-        if self._cookie_signature(parts[0], parts[1]) != parts[2]:
+        if not _time_independent_equals(parts[2],
+                    self._cookie_signature(parts[0], parts[1])):
             logging.warning("Invalid cookie signature %r", value)
             return None
         timestamp = int(parts[1])
@@ -393,6 +414,7 @@ class RequestHandler(object):
             _=self.locale.translate,
             static_url=self.static_url,
             xsrf_form_html=self.xsrf_form_html,
+            reverse_url=self.application.reverse_url
         )
         args.update(self.ui)
         args.update(kwargs)
@@ -402,32 +424,24 @@ class RequestHandler(object):
         """Flushes the current output buffer to the nextwork."""
         if self.application._wsgi:
             raise Exception("WSGI applications do not support flush()")
+
+        chunk = "".join(self._write_buffer)
+        self._write_buffer = []
         if not self._headers_written:
             self._headers_written = True
+            for transform in self._transforms:
+                self._headers, chunk = transform.transform_first_chunk(
+                    self._headers, chunk, include_footers)
             headers = self._generate_headers()
         else:
+            for transform in self._transforms:
+                chunk = transform.transform_chunk(chunk, include_footers)
             headers = ""
 
         # Ignore the chunk and only write the headers for HEAD requests
         if self.request.method == "HEAD":
             if headers: self.request.write(headers)
             return
-
-        if self._write_buffer:
-            chunk = "".join(self._write_buffer)
-            self._write_buffer = []
-            if chunk:
-                # Don't write out empty chunks because that means
-                # END-OF-STREAM with chunked encoding
-                for transform in self._transforms:
-                    chunk = transform.transform_chunk(chunk)
-        else:
-            chunk = ""
-        if include_footers:
-            footers = []
-            for transform in self._transforms:
-                footer = transform.footer()
-                if footer: chunk += footer
 
         if headers or chunk:
             self.request.write(headers + chunk)
@@ -461,7 +475,7 @@ class RequestHandler(object):
             self._log()
         self._finished = True
 
-    def send_error(self, status_code=500):
+    def send_error(self, status_code=500, **kwargs):
         """Sends the given HTTP error code to the browser.
 
         We also send the error HTML for the given error code as returned by
@@ -475,11 +489,15 @@ class RequestHandler(object):
             return
         self.clear()
         self.set_status(status_code)
-        message = self.get_error_html(status_code)
+        message = self.get_error_html(status_code, **kwargs)
         self.finish(message)
 
-    def get_error_html(self, status_code):
-        """Override to implement custom error pages."""
+    def get_error_html(self, status_code, **kwargs):
+        """Override to implement custom error pages.
+
+        If this error was caused by an uncaught exception, the
+        exception object can be found in kwargs e.g. kwargs['exception']
+        """
         return "<html><title>%(code)d: %(message)s</title>" \
                "<body>%(code)d: %(message)s</body></html>" % {
             "code": status_code,
@@ -501,7 +519,7 @@ class RequestHandler(object):
                 self._locale = self.get_browser_locale()
                 assert self._locale
         return self._locale
-            
+
     def get_user_locale(self):
         """Override to determine the locale from the authenticated user.
 
@@ -590,6 +608,8 @@ class RequestHandler(object):
 
         See http://en.wikipedia.org/wiki/Cross-site_request_forgery
         """
+        if self.request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return
         token = self.get_argument("_xsrf", None)
         if not token:
             raise HTTPError(403, "'_xsrf' argument missing from POST")
@@ -672,6 +692,9 @@ class RequestHandler(object):
             raise Exception("You must define the '%s' setting in your "
                             "application to use %s" % (name, feature))
 
+    def reverse_url(self, name, *args):
+        return self.application.reverse_url(name, *args)
+
     def _execute(self, transforms, *args, **kwargs):
         """Executes this request with the given output transforms."""
         self._transforms = transforms
@@ -684,7 +707,7 @@ class RequestHandler(object):
                self.application.settings.get("xsrf_cookies"):
                 self.check_xsrf_cookie()
             self.prepare()
-            if not self._finished:  
+            if not self._finished:
                 getattr(self, self.request.method.lower())(*args, **kwargs)
                 if self._auto_finish and not self._finished:
                     self.finish()
@@ -692,8 +715,6 @@ class RequestHandler(object):
             self._handle_request_exception(e)
 
     def _generate_headers(self):
-        for transform in self._transforms:
-            headers = transform.transform_headers(self._headers)
         lines = [self.request.version + " " + str(self._status_code) + " " +
                  httplib.responses[self._status_code]]
         lines.extend(["%s: %s" % (n, v) for n, v in self._headers.iteritems()])
@@ -725,13 +746,13 @@ class RequestHandler(object):
                 logging.warning(format, *args)
             if e.status_code not in httplib.responses:
                 logging.error("Bad HTTP status code: %d", e.status_code)
-                self.send_error(500)
+                self.send_error(500, exception=e)
             else:
-                self.send_error(e.status_code)
+                self.send_error(e.status_code, exception=e)
         else:
             logging.error("Uncaught exception %s\n%r", self._request_summary(),
                           self.request, exc_info=e)
-            self.send_error(500)
+            self.send_error(500, exception=e)
 
     def _ui_module(self, name, module):
         def render(*args, **kwargs):
@@ -828,10 +849,10 @@ class Application(object):
         http_server.listen(8080)
         ioloop.IOLoop.instance().start()
 
-    The constructor for this class takes in a list of (regexp, request_class)
-    tuples. When we receive requests, we iterate over the list in order and
-    instantiate an instance of the first request class whose regexp matches
-    the request path.
+    The constructor for this class takes in a list of URLSpec objects
+    or (regexp, request_class) tuples. When we receive requests, we
+    iterate over the list in order and instantiate an instance of the
+    first request class whose regexp matches the request path.
 
     Each tuple can contain an optional third element, which should be a
     dictionary if it is present. That dictionary is passed as keyword
@@ -856,10 +877,14 @@ class Application(object):
     def __init__(self, handlers=None, default_host="", transforms=None,
                  wsgi=False, **settings):
         if transforms is None:
-            self.transforms = [ChunkedTransferEncoding]
+            self.transforms = []
+            if settings.get("gzip"):
+                self.transforms.append(GZipContentEncoding)
+            self.transforms.append(ChunkedTransferEncoding)
         else:
             self.transforms = transforms
         self.handlers = []
+        self.named_handlers = {}
         self.default_host = default_host
         self.settings = settings
         self.ui_modules = {}
@@ -889,17 +914,19 @@ class Application(object):
         handlers = []
         self.handlers.append((re.compile(host_pattern), handlers))
 
-        for handler_tuple in host_handlers:
-            assert len(handler_tuple) in (2, 3)
-            pattern = handler_tuple[0]
-            handler = handler_tuple[1]
-            if len(handler_tuple) == 3:
-                kwargs = handler_tuple[2]
-            else:
-                kwargs = {}
-            if not pattern.endswith("$"):
-                pattern += "$"
-            handlers.append((re.compile(pattern), handler, kwargs))
+        for spec in host_handlers:
+            if type(spec) is type(()):
+                assert len(spec) in (2, 3)
+                pattern = spec[0]
+                handler = spec[1]
+                if len(spec) == 3:
+                    kwargs = spec[2]
+                else:
+                    kwargs = {}
+                spec = URLSpec(pattern, handler, kwargs)
+            handlers.append(spec)
+            if spec.name:
+                self.named_handlers[spec.name] = spec
 
     def add_transform(self, transform_class):
         """Adds the given OutputTransform to our transform list."""
@@ -950,14 +977,14 @@ class Application(object):
         handler = None
         args = []
         handlers = self._get_host_handlers(request)
-        if not handlers: 
+        if not handlers:
             handler = RedirectHandler(
                 request, "http://" + self.default_host + "/")
         else:
-            for pattern, handler_class, kwargs in handlers:
-                match = pattern.match(request.path)
+            for spec in handlers:
+                match = spec.regex.match(request.path)
                 if match:
-                    handler = handler_class(self, request, **kwargs)
+                    handler = spec.handler_class(self, request, **spec.kwargs)
                     args = match.groups()
                     break
             if not handler:
@@ -971,6 +998,15 @@ class Application(object):
 
         handler._execute(transforms, *args)
         return handler
+
+    def reverse_url(self, name, *args):
+        """Returns a URL path for handler named `name`
+
+        The handler must be added to the application as a named URLSpec
+        """
+        if name in self.named_handlers:
+            return self.named_handlers[name].reverse(*args)
+        raise KeyError("%s not found in named urls" % name)
 
 
 class HTTPError(Exception):
@@ -1012,7 +1048,7 @@ class RedirectHandler(RequestHandler):
         RequestHandler.__init__(self, application, request)
         self._url = url
         self._permanent = permanent
-        
+
     def get(self):
         self.redirect(self._url, permanent=self._permanent)
 
@@ -1084,34 +1120,90 @@ class StaticFileHandler(RequestHandler):
             file.close()
 
 
+class FallbackHandler(RequestHandler):
+    """A RequestHandler that wraps another HTTP server callback.
+
+    The fallback is a callable object that accepts an HTTPRequest,
+    such as an Application or tornado.wsgi.WSGIContainer.  This is most
+    useful to use both tornado RequestHandlers and WSGI in the same server.
+    Typical usage:
+        wsgi_app = tornado.wsgi.WSGIContainer(
+            django.core.handlers.wsgi.WSGIHandler())
+        application = tornado.web.Application([
+            (r"/foo", FooHandler),
+            (r".*", FallbackHandler, dict(fallback=wsgi_app),
+        ])
+    """
+    def __init__(self, app, request, fallback):
+        RequestHandler.__init__(self, app, request)
+        self.fallback = fallback
+
+    def prepare(self):
+        self.fallback(self.request)
+        self._finished = True
+
+
 class OutputTransform(object):
     """A transform modifies the result of an HTTP request (e.g., GZip encoding)
 
-    A new transform instance is created for every request. The sequence of
-    calls is:
-
-         t = Transform(request) # Constructor
-         # Request processing
-         headers = t.transform_headers(headers)
-         # Write headers
-         for block in result:
-             write(t.transform_chunk(block)
-         write(t.footer())
-
-    See the ChunkedTransferEncoding example below if you want to implement a
+    A new transform instance is created for every request. See the
+    ChunkedTransferEncoding example below if you want to implement a
     new Transform.
     """
     def __init__(self, request):
         pass
 
-    def transform_headers(self, headers):
-        return headers
+    def transform_first_chunk(self, headers, chunk, finishing):
+        return headers, chunk
 
-    def transform_chunk(self, block):
-        return block
+    def transform_chunk(self, chunk, finishing):
+        return chunk
 
-    def footer(self):
-        return None
+
+class GZipContentEncoding(OutputTransform):
+    """Applies the gzip content encoding to the response.
+
+    See http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.11
+    """
+    CONTENT_TYPES = set([
+        "text/plain", "text/html", "text/css", "text/xml",
+        "application/x-javascript", "application/xml", "application/atom+xml",
+        "text/javascript", "application/json", "application/xhtml+xml"])
+    MIN_LENGTH = 5
+
+    def __init__(self, request):
+        self._gzipping = request.supports_http_1_1() and \
+            "gzip" in request.headers.get("Accept-Encoding", "")
+
+    def transform_first_chunk(self, headers, chunk, finishing):
+        if self._gzipping:
+            ctype = headers.get("Content-Type", "").split(";")[0]
+            self._gzipping = (ctype in self.CONTENT_TYPES) and \
+                (not finishing or len(chunk) >= self.MIN_LENGTH) and \
+                (finishing or "Content-Length" not in headers) and \
+                ("Content-Encoding" not in headers)
+        if self._gzipping:
+            headers["Content-Encoding"] = "gzip"
+            self._gzip_value = cStringIO.StringIO()
+            self._gzip_file = gzip.GzipFile(mode="w", fileobj=self._gzip_value)
+            self._gzip_pos = 0
+            chunk = self.transform_chunk(chunk, finishing)
+            if "Content-Length" in headers:
+                headers["Content-Length"] = str(len(chunk))
+        return headers, chunk
+
+    def transform_chunk(self, chunk, finishing):
+        if self._gzipping:
+            self._gzip_file.write(chunk)
+            if finishing:
+                self._gzip_file.close()
+            else:
+                self._gzip_file.flush()
+            chunk = self._gzip_value.getvalue()
+            if self._gzip_pos > 0:
+                chunk = chunk[self._gzip_pos:]
+            self._gzip_pos += len(chunk)
+        return chunk
 
 
 class ChunkedTransferEncoding(OutputTransform):
@@ -1122,26 +1214,25 @@ class ChunkedTransferEncoding(OutputTransform):
     def __init__(self, request):
         self._chunking = request.supports_http_1_1()
 
-    def transform_headers(self, headers):
+    def transform_first_chunk(self, headers, chunk, finishing):
         if self._chunking:
             # No need to chunk the output if a Content-Length is specified
             if "Content-Length" in headers or "Transfer-Encoding" in headers:
                 self._chunking = False
             else:
                 headers["Transfer-Encoding"] = "chunked"
-        return headers
-        
-    def transform_chunk(self, block):
-        if self._chunking:
-            return ("%x" % len(block)) + "\r\n" + block + "\r\n"
-        else:
-            return block
+                chunk = self.transform_chunk(chunk, finishing)
+        return headers, chunk
 
-    def footer(self):
+    def transform_chunk(self, block, finishing):
         if self._chunking:
-            return "0\r\n\r\n"
-        else:
-            return None
+            # Don't write out empty chunks because that means END-OF-STREAM
+            # with chunked encoding
+            if block:
+                block = ("%x" % len(block)) + "\r\n" + block + "\r\n"
+            if finishing:
+                block += "0\r\n\r\n"
+        return block
 
 
 def authenticated(method):
@@ -1200,6 +1291,67 @@ class UIModule(object):
     def render_string(self, path, **kwargs):
         return self.handler.render_string(path, **kwargs)
 
+class URLSpec(object):
+    """Specifies mappings between URLs and handlers."""
+    def __init__(self, pattern, handler_class, kwargs={}, name=None):
+        """Creates a URLSpec.
+
+        Parameters:
+        pattern: Regular expression to be matched.  Any groups in the regex
+            will be passed in to the handler's get/post/etc methods as
+            arguments.
+        handler_class: RequestHandler subclass to be invoked.
+        kwargs (optional): A dictionary of additional arguments to be passed
+            to the handler's constructor.
+        name (optional): A name for this handler.  Used by
+            Application.reverse_url.
+        """
+        if not pattern.endswith('$'):
+            pattern += '$'
+        self.regex = re.compile(pattern)
+        self.handler_class = handler_class
+        self.kwargs = kwargs
+        self.name = name
+        self._path, self._group_count = self._find_groups()
+
+    def _find_groups(self):
+        """Returns a tuple (reverse string, group count) for a url.
+
+        For example: Given the url pattern /([0-9]{4})/([a-z-]+)/, this method
+        would return ('/%s/%s/', 2).
+        """
+        pattern = self.regex.pattern
+        if pattern.startswith('^'):
+            pattern = pattern[1:]
+        if pattern.endswith('$'):
+            pattern = pattern[:-1]
+
+        if self.regex.groups != pattern.count('('):
+            # The pattern is too complicated for our simplistic matching,
+            # so we can't support reversing it.
+            return (None, None)
+
+        pieces = []
+        for fragment in pattern.split('('):
+            if ')' in fragment:
+                paren_loc = fragment.index(')')
+                if paren_loc >= 0:
+                    pieces.append('%s' + fragment[paren_loc + 1:])
+            else:
+                pieces.append(fragment)
+
+        return (''.join(pieces), self.regex.groups)
+
+    def reverse(self, *args):
+        assert self._path is not None, \
+            "Cannot reverse url regex " + self.regex.pattern
+        assert len(args) == self._group_count, "required number of arguments "\
+            "not found"
+        if not len(args):
+            return self._path
+        return self._path % tuple([str(a) for a in args])
+
+url = URLSpec
 
 def _utf8(s):
     if isinstance(s, unicode):
@@ -1216,6 +1368,15 @@ def _unicode(s):
             raise HTTPError(400, "Non-utf8 argument")
     assert isinstance(s, unicode)
     return s
+
+
+def _time_independent_equals(a, b):
+    if len(a) != len(b):
+        return False
+    result = 0
+    for x, y in zip(a, b):
+        result |= ord(x) ^ ord(y)
+    return result == 0
 
 
 class _O(dict):
